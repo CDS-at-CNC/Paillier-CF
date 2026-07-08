@@ -1,1 +1,13 @@
-*/target
+# Cargo
+/target
+
+# Fichiers de résultats générés à l'exécution (PSI)
+/src/dataFromPSI/*.csv
+
+# Clés locales (si jamais persistées en clair pendant des tests)
+/src/keys/*.json
+
+# Éditeurs / OS
+.vscode/
+.idea/
+.DS_Store
