@@ -31,7 +31,7 @@ Architecture **mono-clé asymétrique** : un seul des deux hôpitaux détient la
 |---|---|---|
 | **H1** (récepteur) | ✅ Oui | Cardinal exact de l'intersection **+** identité des patients en commun |
 | **H2** (émetteur) | ❌ Non | Rien — H2 chiffre et envoie, sans jamais recevoir de résultat |
-| **Serveur** (tiers de calcul) | ❌ Non | Voit les positions communes en clair (compromis assumé, cf. plus bas) mais jamais les valeurs déchiffrées ni `sk` |
+| **Serveur** (tiers de calcul) | ❌ Non | Voit les positions chiffrés mais jamais les valeurs en clair déchiffrées, ni `sk` |
 
 ```
 H1 ──pk_H1──▶ Serveur ──pk_H1──▶ H2
