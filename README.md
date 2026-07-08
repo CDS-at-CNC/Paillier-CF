@@ -2,7 +2,7 @@
 
 Bibliothèque Rust implémentant un protocole de **Private Set Intersection (PSI) à cardinalité exacte**, combinant le cryptosystème de **Paillier** (chiffrement homomorphe additif) et le schéma de **Catalano-Fiore** (multiplication homomorphe depth-1), pour calculer l'intersection entre deux bases de données (patients, contacts CRM, etc.) sans que ni le serveur ni l'une des deux parties n'accède aux données en clair de l'autre.
 
-> **Statut : PoC / MVP.** Certains compromis de sécurité sont assumés explicitement pour ce stade du projet — voir [§ Compromis de sécurité assumés](#compromis-de-sécurité-assumés).
+> **Statut : PoC / MVP.**
 
 ---
 
@@ -17,7 +17,6 @@ Bibliothèque Rust implémentant un protocole de **Private Set Intersection (PSI
 - [Résultat de sortie](#résultat-de-sortie)
 - [Logs DevOps — chiffrés échantillon](#logs-devops--chiffrés-échantillon)
 - [Bindings Python (PyO3 / maturin)](#bindings-python-pyo3--maturin)
-- [Compromis de sécurité assumés](#compromis-de-sécurité-assumés)
 - [Paramètres à durcir avant production](#paramètres-à-durcir-avant-production)
 - [Roadmap](#roadmap)
 
@@ -149,18 +148,6 @@ maturin develop --features python
 
 Couvre les primitives Paillier directes, les 4 phases PSI, l'échantillon de chiffrés DevOps, et une exception centralisée `PsiCryptoError`. **Voir `PYTHON_BINDINGS.md` pour la référence API complète** (classes, signatures, modèle d'erreurs, check-list d'intégration par rôle).
 
-## Compromis de sécurité assumés
-
-Ce PoC fait des choix explicites en faveur de la rapidité de développement et de la richesse fonctionnelle (identification des patients, pas seulement leur nombre), au prix de propriétés de confidentialité plus fortes qui seraient nécessaires en production :
-
-| Compromis | Détail | Conséquence |
-|---|---|---|
-| **Positions en clair côté serveur** | Le serveur compare `t1[i] = t2[i] = 1` directement sur les positions reçues, sans domaine dense masquant | Le serveur peut déduire la taille de l'intersection, et par attaque par dictionnaire sur le hash non salé (`simple_hash`), potentiellement les emails eux-mêmes |
-| **Hash non cryptographique pour le bucketing** | `simple_hash` (usage interne, type SDBM 32 bits) sert uniquement à indexer la table, pas à garantir une résistance aux collisions | Risque de collision interne géré par un domaine `TABLE_SIZE = 2^14` — acceptable pour `n ≲ 1000`, à surveiller au-delà |
-| **`MIN_KEY_BITS = 512`** | Taille de clé réduite pour un keygen rapide en PoC | Trop faible pour un usage réel — voir tableau ci-dessous |
-| **Erreurs internes PSI encore partiellement basées sur `.expect()`** | Les 4 fonctions de phase PSI ne propagent pas encore systématiquement `Result<_, CryptoError>` | Filet de sécurité automatique PyO3 côté Python (panic → exception, pas de crash), mais message d'erreur moins structuré que les primitives Paillier directes |
-
-Une variante alternative (« bucket + comparaison exacte SHA-256 », qui élimine les faux positifs entre parties) a été explorée et reste présente dans `exactmatch.rs` (fonctions `phase1_build_bucket_table`, `psi_phase3_server_blind_diff`, etc.) mais n'est **pas branchée** dans les binaires actuels — voir `CHANGELOG_mono_cle_agrege.md` pour le détail de pourquoi elle a été mise de côté pour ce PoC.
 
 ## Paramètres à durcir avant production
 
