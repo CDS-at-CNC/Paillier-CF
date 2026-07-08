@@ -50,7 +50,7 @@ H1 ──Ft_H1──▶ Serveur ◀──Ft_H2── H2
 | **0** | H1 | Génère l'unique paire de clés Paillier (`pk`, `sk`) ; envoie `pk` au serveur, qui la relaie à H2. `sk` ne quitte jamais H1. |
 | **1** | H1, H2 | Construit une table binaire creuse : `t[h(email)] = 1` pour chaque identifiant. |
 | **2** | H1, H2 | Chiffre les positions actives via Catalano-Fiore (première forme) sous `pk` de H1. |
-| **3** | Serveur | Compare les positions **en clair**, applique `CF.Mul` sur les positions communes, agrège en un seul chiffré Paillier (`C0_agg`) + collecte les `Enc(b')`. Renvoie le tout à H1 uniquement. |
+| **3** | Serveur | Calcule sur les positions reçue au format CF1, applique `CF.Mul` sur les positions reçues, agrège en un seul chiffré Paillier (`C0_agg`) + collecte les `Enc(b')`. Renvoie le tout à H1 uniquement. |
 | **4** | H1 | Reconstruit le terme croisé par exponentiation homomorphe, déchiffre (2 opérations Paillier au lieu de `3k`) → cardinal exact. Identifie **localement** les patients communs par un simple lookup position → email (aucun calcul crypto supplémentaire). |
 
 La construction mathématique complète est documentée dans `CHANGELOG_mono_cle_agrege.md`.
