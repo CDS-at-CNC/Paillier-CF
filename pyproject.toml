@@ -1,0 +1,20 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "paillier_crypto"
+version = "0.1.0"
+description = "Bindings Python (PyO3) pour le protocole PSI-ExactMatch (Paillier + Catalano-Fiore)"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+
+[tool.maturin]
+# Active le feature Cargo "python" (pyo3, gaté, cf. Cargo.toml) — les
+# binaires server/client/paillier_crypto restent, eux, compilés sans pyo3.
+features = ["python"]
+# Nom du module tel qu'importé côté Python : `import paillier_crypto`
+module-name = "paillier_crypto"

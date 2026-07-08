@@ -1,0 +1,117 @@
+[package]
+name    = "paillier_crypto"
+version = "0.1.0"
+edition = "2021"
+
+# ---------------------------------------------------------------------------
+# Bibliothèque — cdylib pour maturin/PyO3 (import Python), rlib pour que les
+# binaires ci-dessous (server/client/paillier_crypto) continuent de linker
+# cette crate normalement en Rust pur.
+# ---------------------------------------------------------------------------
+[lib]
+name = "paillier_crypto"
+crate-type = ["cdylib", "rlib"]
+
+# ---------------------------------------------------------------------------
+# Binaires
+# ---------------------------------------------------------------------------
+
+# Binaire principal (menu interactif + métriques)
+[[bin]]
+name = "paillier_crypto"
+path = "src/main.rs"
+
+# Serveur PSI — tiers de confiance neutre
+[[bin]]
+name = "server"
+path = "src/bin/server.rs"
+
+# Client PSI — BD1 ou BD2
+[[bin]]
+name = "client"
+path = "src/bin/client.rs"
+
+# ---------------------------------------------------------------------------
+# Dépendances
+# ---------------------------------------------------------------------------
+
+[dependencies]
+
+# ── Arithmétique grands entiers ────────────────────────────────────────────
+
+# BigUint / BigInt — arithmétique modulaire, modpow, gcd, shifts
+# Feature "rand" active le trait RandBigInt (gen_biguint, gen_biguint_range…)
+num-bigint  = { version = "0.4", features = ["rand"] }
+
+# Traits One, Zero, Num — utilisés dans math.rs, montgomery.rs, key_storage.rs
+num-traits  = "0.2"
+
+# Trait Integer (.is_even(), .gcd()) — utilisé dans math.rs (Miller-Rabin)
+num-integer = "0.1"
+
+# ── Hachage cryptographique (identité exacte, protocole bucket + comparaison) ──
+
+# SHA-256 sur 256 bits — sert de valeur d'identité m_p pour le test d'égalité
+# homomorphe exacte (élimine les faux positifs inter-parties du bucketing).
+sha2        = "0.10"
+
+# ── Génération de nombres aléatoires ──────────────────────────────────────
+
+# OsRng (entropie système) + RngCore trait — utilisés partout pour les clés
+rand_core   = { version = "0.6", features = ["std"] }
+
+# Rng trait (gen_biguint_below dans main.rs et exactmatch.rs)
+rand        = "0.8"
+
+# ── Sérialisation ─────────────────────────────────────────────────────────
+
+# Derive Serialize/Deserialize — structures Json dans key_storage.rs
+serde       = { version = "1", features = ["derive"] }
+
+# Parsing/écriture JSON (serde_json::from_str, to_string_pretty)
+# Utilisé dans key_storage.rs pour charger/sauvegarder les clés Paillier
+serde_json  = "1"
+
+# Sérialisation binaire compacte pour le tunnel socket (net_protocol.rs)
+# Encode/décode les messages réseau entre server.rs et client.rs
+bincode     = "1"
+
+# ── Sécurité mémoire ───────────────────────────────────────────────────────
+
+# Trait Zeroize — implémenté sur SecretKey dans p_keygen.rs
+# Efface lambda et mu de la mémoire à la destruction de la struct
+zeroize     = "1"
+
+# ── Bindings Python (optionnel, activé via --features python) ─────────────
+
+# PyO3 : génère l'extension Python (via maturin). `extension-module`
+# évite de linker libpython statiquement (le symbole est fourni par
+# l'interpréteur Python au chargement) — nécessaire pour un .so/.pyd
+# chargeable par n'importe quel interpréteur compatible.
+# Optionnel : les binaires server/client/paillier_crypto ne dépendent
+# JAMAIS de pyo3, seul `maturin build --features python` l'active.
+pyo3        = { version = "0.22", features = ["extension-module"], optional = true }
+
+# ---------------------------------------------------------------------------
+# Features
+# ---------------------------------------------------------------------------
+
+[features]
+default = []
+python  = ["dep:pyo3"]
+
+# ---------------------------------------------------------------------------
+# Profils de compilation
+# ---------------------------------------------------------------------------
+
+[profile.dev]
+# opt-level 1 : indispensable pour que les modpow sur BigUint soient
+# supportables en dev (sans ça, une génération de clé 1024 bits peut
+# prendre plusieurs minutes en debug pur).
+opt-level = 1
+
+[profile.release]
+opt-level     = 3    # Optimisation maximale
+lto           = true # Link-Time Optimization (inter-modules)
+codegen-units = 1    # Un seul codegen unit pour maximiser les inlining
+strip         = true # Supprime les symboles debug du binaire final
