@@ -7,6 +7,7 @@ pub mod fiore_catalano;
 pub mod key_management;
 pub mod paillier_kea;
 pub mod karatsuba_mul;
+pub mod hepseudo;         // ← FHEnymisation (ported from v0.4.0 HEpseudo)
 
 // Bindings Python (PyO3) — compilés UNIQUEMENT avec `--features python`
 // (utilisé par maturin). N'affecte jamais les binaires server/client/
