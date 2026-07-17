@@ -28,14 +28,20 @@
 // s'appuient sur ce filet de sécurité PyO3.
 // =========================================================
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use num_bigint::BigUint;
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
+use serde::{Deserialize, Serialize};
 
 use crate::crypto_error::crypto_error::CryptoError;
+use crate::hepseudo::{
+    encode_pii, p_encrypt_det, parse_ddn, server_remask, ClientRecord, PatientPii, ServerResponse,
+};
+use crate::paillier::p_keygen::p_keygen::SecretKey;
 use crate::exactmatch::{
     load_ids_from_csv, phase1_build_table, phase2_prepare_ft, phase3_server_aggregate,
     phase4_decrypt_aggregate, AggResult, FtBundle, SparseTable,
@@ -65,10 +71,80 @@ fn biguint_to_hex(v: &BigUint) -> String {
 }
 
 // =========================================================
+// Key (de)serialization for persistence (bincode of big-endian bytes).
+//
+// Paillier-CF's PyKeyPair/PyPublicKey originally could not round-trip
+// through storage. The Python backends generate the key in one HTTP
+// request (keygen) and reload it in another (compute/decrypt), so the
+// keypair MUST be serializable. Ported from the v0.4.0 module.
+// =========================================================
+
+#[derive(Serialize, Deserialize)]
+struct PublicKeyBytes {
+    pub_n: Vec<u8>,
+    pub_g: Vec<u8>,
+    pub_n_squared: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct KeyPairBytes {
+    pub_n: Vec<u8>,
+    pub_g: Vec<u8>,
+    pub_n_squared: Vec<u8>,
+    sec_lambda: Vec<u8>,
+    sec_mu: Vec<u8>,
+}
+
+fn pk_to_bytes_helper(pk: &PublicKey) -> PyResult<Vec<u8>> {
+    let data = PublicKeyBytes {
+        pub_n: pk.n.to_bytes_be(),
+        pub_g: pk.g.to_bytes_be(),
+        pub_n_squared: pk.n_squared.to_bytes_be(),
+    };
+    bincode::serialize(&data).map_err(|e| PsiCryptoError::new_err(e.to_string()))
+}
+
+fn pk_from_bytes_helper(data: &[u8]) -> PyResult<PublicKey> {
+    let pkb: PublicKeyBytes =
+        bincode::deserialize(data).map_err(|e| PsiCryptoError::new_err(e.to_string()))?;
+    Ok(PublicKey {
+        n: BigUint::from_bytes_be(&pkb.pub_n),
+        g: BigUint::from_bytes_be(&pkb.pub_g),
+        n_squared: BigUint::from_bytes_be(&pkb.pub_n_squared),
+    })
+}
+
+fn kp_to_bytes_helper(kp: &KeyPair) -> PyResult<Vec<u8>> {
+    let data = KeyPairBytes {
+        pub_n: kp.public_key.n.to_bytes_be(),
+        pub_g: kp.public_key.g.to_bytes_be(),
+        pub_n_squared: kp.public_key.n_squared.to_bytes_be(),
+        sec_lambda: kp.secret_key.lambda.to_bytes_be(),
+        sec_mu: kp.secret_key.mu.to_bytes_be(),
+    };
+    bincode::serialize(&data).map_err(|e| PsiCryptoError::new_err(e.to_string()))
+}
+
+fn kp_from_bytes_helper(data: &[u8]) -> PyResult<KeyPair> {
+    let kpb: KeyPairBytes =
+        bincode::deserialize(data).map_err(|e| PsiCryptoError::new_err(e.to_string()))?;
+    let public_key = PublicKey {
+        n: BigUint::from_bytes_be(&kpb.pub_n),
+        g: BigUint::from_bytes_be(&kpb.pub_g),
+        n_squared: BigUint::from_bytes_be(&kpb.pub_n_squared),
+    };
+    let secret_key = SecretKey {
+        lambda: BigUint::from_bytes_be(&kpb.sec_lambda),
+        mu: BigUint::from_bytes_be(&kpb.sec_mu),
+    };
+    Ok(KeyPair { public_key, secret_key })
+}
+
+// =========================================================
 // Clé publique Paillier — sérialisable côté Python (n, g, n²).
 // =========================================================
 
-#[pyclass]
+#[pyclass(name = "PublicKey")]
 #[derive(Clone)]
 pub struct PyPublicKey {
     pub(crate) inner: PublicKey,
@@ -106,6 +182,17 @@ impl PyPublicKey {
         self.inner.n.bits()
     }
 
+    /// Serialize the public key (n, g, n²) to bytes for storage/transport.
+    fn to_bytes(&self) -> PyResult<Cow<'static, [u8]>> {
+        Ok(Cow::Owned(pk_to_bytes_helper(&self.inner)?))
+    }
+
+    /// Rebuild a public key from bytes produced by `to_bytes`.
+    #[staticmethod]
+    fn from_bytes(data: &[u8]) -> PyResult<Self> {
+        Ok(PyPublicKey { inner: pk_from_bytes_helper(data)? })
+    }
+
     fn __repr__(&self) -> String {
         format!("PyPublicKey(|n|={} bits)", self.inner.n.bits())
     }
@@ -121,14 +208,15 @@ impl PyPublicKey {
 // ne jamais transmettre sur le réseau).
 // =========================================================
 
-#[pyclass]
+#[pyclass(name = "KeyPair")]
 pub struct PyKeyPair {
     pub(crate) inner: KeyPair,
 }
 
 #[pymethods]
 impl PyKeyPair {
-    #[getter]
+    /// Return a copy of the public key. Exposed as a METHOD (`kp.public_key()`)
+    /// to match the surface the Python backends already call.
     fn public_key(&self) -> PyPublicKey {
         PyPublicKey { inner: self.inner.public_key.clone() }
     }
@@ -141,6 +229,17 @@ impl PyKeyPair {
             biguint_to_hex(&self.inner.secret_key.lambda),
             biguint_to_hex(&self.inner.secret_key.mu),
         )
+    }
+
+    /// Serialize the full keypair (pk + sk) to bytes. Keep local to H1.
+    fn to_bytes(&self) -> PyResult<Cow<'static, [u8]>> {
+        Ok(Cow::Owned(kp_to_bytes_helper(&self.inner)?))
+    }
+
+    /// Rebuild a keypair from bytes produced by `to_bytes`.
+    #[staticmethod]
+    fn from_bytes(data: &[u8]) -> PyResult<Self> {
+        Ok(PyKeyPair { inner: kp_from_bytes_helper(data)? })
     }
 
     fn __repr__(&self) -> String {
@@ -359,12 +458,325 @@ fn psi_phase4_decrypt_aggregate(
 }
 
 // =========================================================
+// FHEnymisation — bindings (module hepseudo, porté de v0.4.0)
+//
+// Workflow distribué :
+//   1. Client : py_fhenym_encrypt_csv(csv, pk) -> FhenymBatch
+//      (PII chiffrés déterministes + colonnes métier en clair).
+//   2. Serveur : py_fhenym_server_remask(batch, pk) -> FhenymResponseBatch
+//      (FE_i = Enc_i^b mod n², un seul b pour le batch).
+//   3. Client : py_fhenym_format_pseudonymes_csv(resp) -> CSV bytes
+//      ("Pseudonyme Patient,<cols métier>").
+// La sk n'est pas utilisée : les FE SONT les pseudonymes.
+// =========================================================
+
+#[derive(Serialize, Deserialize)]
+struct ClientRecordBytes {
+    enc_m: Vec<u8>,
+    metier_vals: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct FhenymBatchBytes {
+    records: Vec<ClientRecordBytes>,
+    metier_names: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ServerResponseBytes {
+    fe: Vec<u8>,
+    metier_vals: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct FhenymResponseBatchBytes {
+    responses: Vec<ServerResponseBytes>,
+    metier_names: Vec<String>,
+}
+
+/// Client-side batch: deterministic-encrypted records + business column names.
+#[pyclass(name = "FhenymBatch")]
+pub struct PyFhenymBatch {
+    pub records: Vec<ClientRecord>,
+    pub metier_names: Vec<String>,
+}
+
+#[pymethods]
+impl PyFhenymBatch {
+    fn len(&self) -> usize {
+        self.records.len()
+    }
+    fn metier_names(&self) -> Vec<String> {
+        self.metier_names.clone()
+    }
+
+    fn to_bytes(&self) -> PyResult<Cow<'static, [u8]>> {
+        let data = FhenymBatchBytes {
+            records: self
+                .records
+                .iter()
+                .map(|r| ClientRecordBytes {
+                    enc_m: r.enc_m.to_bytes_be(),
+                    metier_vals: r.metier_vals.clone(),
+                })
+                .collect(),
+            metier_names: self.metier_names.clone(),
+        };
+        let v = bincode::serialize(&data).map_err(|e| PsiCryptoError::new_err(e.to_string()))?;
+        Ok(Cow::Owned(v))
+    }
+
+    #[staticmethod]
+    fn from_bytes(data: &[u8]) -> PyResult<PyFhenymBatch> {
+        let raw: FhenymBatchBytes =
+            bincode::deserialize(data).map_err(|e| PsiCryptoError::new_err(e.to_string()))?;
+        let records = raw
+            .records
+            .into_iter()
+            .map(|r| ClientRecord {
+                enc_m: BigUint::from_bytes_be(&r.enc_m),
+                metier_vals: r.metier_vals,
+            })
+            .collect();
+        Ok(PyFhenymBatch { records, metier_names: raw.metier_names })
+    }
+
+    fn __repr__(&self) -> String {
+        format!("FhenymBatch({} records, {} colonnes metier)", self.records.len(), self.metier_names.len())
+    }
+}
+
+/// Server-side batch: pseudonyms (FE) + business column names.
+#[pyclass(name = "FhenymResponseBatch")]
+pub struct PyFhenymResponseBatch {
+    pub responses: Vec<ServerResponse>,
+    pub metier_names: Vec<String>,
+}
+
+#[pymethods]
+impl PyFhenymResponseBatch {
+    fn len(&self) -> usize {
+        self.responses.len()
+    }
+    fn metier_names(&self) -> Vec<String> {
+        self.metier_names.clone()
+    }
+
+    fn to_bytes(&self) -> PyResult<Cow<'static, [u8]>> {
+        let data = FhenymResponseBatchBytes {
+            responses: self
+                .responses
+                .iter()
+                .map(|r| ServerResponseBytes {
+                    fe: r.fe.to_bytes_be(),
+                    metier_vals: r.metier_vals.clone(),
+                })
+                .collect(),
+            metier_names: self.metier_names.clone(),
+        };
+        let v = bincode::serialize(&data).map_err(|e| PsiCryptoError::new_err(e.to_string()))?;
+        Ok(Cow::Owned(v))
+    }
+
+    #[staticmethod]
+    fn from_bytes(data: &[u8]) -> PyResult<PyFhenymResponseBatch> {
+        let raw: FhenymResponseBatchBytes =
+            bincode::deserialize(data).map_err(|e| PsiCryptoError::new_err(e.to_string()))?;
+        let responses = raw
+            .responses
+            .into_iter()
+            .map(|r| ServerResponse {
+                fe: BigUint::from_bytes_be(&r.fe),
+                metier_vals: r.metier_vals,
+            })
+            .collect();
+        Ok(PyFhenymResponseBatch { responses, metier_names: raw.metier_names })
+    }
+
+    fn __repr__(&self) -> String {
+        format!("FhenymResponseBatch({} pseudonymes, {} colonnes metier)", self.responses.len(), self.metier_names.len())
+    }
+}
+
+// ── PII labels (identical to the ported client encoder) ──────────────────────
+const FHENYM_LABEL_ID: &str = "id";
+const FHENYM_LABEL_PRENOM: &str = "prenom";
+const FHENYM_LABEL_NOM: &str = "nom";
+const FHENYM_LABEL_AGE: &str = "age";
+const FHENYM_LABEL_DDN: &str = "date de naissance";
+const FHENYM_LABEL_NSS: &str = "numéro de sécurité sociale";
+
+fn fhenym_normalize(s: &str) -> String {
+    s.trim().to_lowercase()
+}
+
+fn fhenym_is_pii(name: &str) -> bool {
+    matches!(
+        name,
+        FHENYM_LABEL_ID | FHENYM_LABEL_PRENOM | FHENYM_LABEL_NOM
+            | FHENYM_LABEL_AGE | FHENYM_LABEL_DDN | FHENYM_LABEL_NSS
+    )
+}
+
+fn fhenym_detect_sep(header: &str) -> char {
+    if header.contains(';') {
+        ';'
+    } else if header.contains('\t') {
+        '\t'
+    } else if header.contains('|') {
+        '|'
+    } else {
+        ','
+    }
+}
+
+/// Client — parse the CSV, encode each PII and deterministically encrypt under pk.
+/// Required columns (case-insensitive): id, prenom, nom, age, date de naissance,
+/// numéro de sécurité sociale. Every other column is kept as a business column.
+#[pyfunction]
+fn py_fhenym_encrypt_csv(csv_bytes: &[u8], pk: &PyPublicKey) -> PyResult<PyFhenymBatch> {
+    let content = std::str::from_utf8(csv_bytes)
+        .map_err(|e| PsiCryptoError::new_err(format!("CSV non UTF-8: {}", e)))?;
+
+    let mut lines = content.lines();
+    let header = lines
+        .next()
+        .ok_or_else(|| PsiCryptoError::new_err("CSV vide (en-tete manquant)"))?;
+
+    let sep = fhenym_detect_sep(header);
+    let cols: Vec<&str> = header.split(sep).collect();
+    let cols_norm: Vec<String> = cols.iter().map(|c| fhenym_normalize(c)).collect();
+
+    let find = |label: &str| -> PyResult<usize> {
+        cols_norm
+            .iter()
+            .position(|c| c == label)
+            .ok_or_else(|| PsiCryptoError::new_err(format!("Colonne PII manquante : '{}'", label)))
+    };
+
+    let i_id = find(FHENYM_LABEL_ID)?;
+    let i_prenom = find(FHENYM_LABEL_PRENOM)?;
+    let i_nom = find(FHENYM_LABEL_NOM)?;
+    let i_age = find(FHENYM_LABEL_AGE)?;
+    let i_ddn = find(FHENYM_LABEL_DDN)?;
+    let i_nss = find(FHENYM_LABEL_NSS)?;
+
+    let metier: Vec<(usize, String)> = cols
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !fhenym_is_pii(&fhenym_normalize(c)))
+        .map(|(i, c)| (i, c.trim().to_string()))
+        .collect();
+
+    let metier_names: Vec<String> = metier.iter().map(|(_, n)| n.clone()).collect();
+
+    let mut records: Vec<ClientRecord> = Vec::new();
+    let mut line_no: u64 = 1;
+
+    for line in lines {
+        line_no += 1;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let fields: Vec<&str> = line.split(sep).collect();
+
+        let get_field = |idx: usize, name: &str| -> PyResult<&str> {
+            fields
+                .get(idx)
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    PsiCryptoError::new_err(format!("Ligne {}: champ '{}' absent ou vide", line_no, name))
+                })
+        };
+
+        let id = get_field(i_id, FHENYM_LABEL_ID)?.to_string();
+        let prenom = get_field(i_prenom, FHENYM_LABEL_PRENOM)?.to_string();
+        let nom = get_field(i_nom, FHENYM_LABEL_NOM)?.to_string();
+
+        let age_s = get_field(i_age, FHENYM_LABEL_AGE)?;
+        let age: u8 = age_s
+            .parse()
+            .map_err(|_| PsiCryptoError::new_err(format!("Ligne {}: age invalide '{}'", line_no, age_s)))?;
+
+        let ddn_s = get_field(i_ddn, FHENYM_LABEL_DDN)?;
+        let ddn = parse_ddn(ddn_s).map_err(to_py_err)?;
+
+        let nss = get_field(i_nss, FHENYM_LABEL_NSS)?.to_string();
+
+        let metier_vals: Vec<String> = metier
+            .iter()
+            .map(|(i, _)| fields.get(*i).map(|s| s.trim().to_string()).unwrap_or_default())
+            .collect();
+
+        let pii = PatientPii { id, prenom, nom, age, ddn, nss };
+        let m = encode_pii(&pii).map_err(to_py_err)?;
+        let enc_m = p_encrypt_det(&m, &pk.inner).map_err(to_py_err)?;
+
+        records.push(ClientRecord { enc_m, metier_vals });
+    }
+
+    Ok(PyFhenymBatch { records, metier_names })
+}
+
+/// Server — FE_i = Enc_i^b mod n², b drawn once for the batch.
+#[pyfunction]
+fn py_fhenym_server_remask(batch: &PyFhenymBatch, pk: &PyPublicKey) -> PyResult<PyFhenymResponseBatch> {
+    let responses = server_remask(&batch.records, &pk.inner).map_err(to_py_err)?;
+    Ok(PyFhenymResponseBatch { responses, metier_names: batch.metier_names.clone() })
+}
+
+/// Truncate an FE (hex) into a readable pseudonym: first 10 + '…' + last 5.
+fn fhenym_truncate_pseudo(hex: &str) -> String {
+    if hex.len() <= 15 {
+        hex.to_string()
+    } else {
+        format!("{}…{}", &hex[..10], &hex[hex.len() - 5..])
+    }
+}
+
+/// Client — build the final CSV from a FhenymResponseBatch.
+/// Header: "Pseudonyme Patient,<col métier 1>,<col métier 2>,…".
+#[pyfunction]
+fn py_fhenym_format_pseudonymes_csv(batch: &PyFhenymResponseBatch) -> PyResult<Cow<'static, [u8]>> {
+    let mut out = String::new();
+    out.push_str("Pseudonyme Patient");
+    for name in &batch.metier_names {
+        out.push(',');
+        out.push_str(name);
+    }
+    out.push('\n');
+
+    for resp in &batch.responses {
+        let hex = resp.fe.to_str_radix(16);
+        let pseudo = fhenym_truncate_pseudo(&hex);
+        out.push_str(&pseudo);
+        for v in &resp.metier_vals {
+            out.push(',');
+            out.push_str(v);
+        }
+        out.push('\n');
+    }
+    Ok(Cow::Owned(out.into_bytes()))
+}
+
+/// Full single-process pipeline (tests / worker-does-everything).
+#[pyfunction]
+fn py_fhenym_run_full(csv_bytes: &[u8], pk: &PyPublicKey) -> PyResult<Cow<'static, [u8]>> {
+    let batch = py_fhenym_encrypt_csv(csv_bytes, pk)?;
+    let responses = py_fhenym_server_remask(&batch, pk)?;
+    py_fhenym_format_pseudonymes_csv(&responses)
+}
+
+// =========================================================
 // Déclaration du module Python : `import paillier_crypto`
 // =========================================================
 
 #[pymodule]
 fn paillier_crypto(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add("PsiCryptoError", py.get_type::<PsiCryptoError>())?;
+    m.add("PsiCryptoError", py.get_type_bound::<PsiCryptoError>())?;
 
     m.add_class::<PyPublicKey>()?;
     m.add_class::<PyKeyPair>()?;
@@ -372,6 +784,8 @@ fn paillier_crypto(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyFtBundle>()?;
     m.add_class::<PyAggResult>()?;
     m.add_class::<PyExactMatchResult>()?;
+    m.add_class::<PyFhenymBatch>()?;
+    m.add_class::<PyFhenymResponseBatch>()?;
 
     m.add_function(wrap_pyfunction!(paillier_keygen, m)?)?;
     m.add_function(wrap_pyfunction!(paillier_encrypt, m)?)?;
@@ -382,6 +796,11 @@ fn paillier_crypto(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(psi_phase2_prepare_ft, m)?)?;
     m.add_function(wrap_pyfunction!(psi_phase3_server_aggregate, m)?)?;
     m.add_function(wrap_pyfunction!(psi_phase4_decrypt_aggregate, m)?)?;
+
+    m.add_function(wrap_pyfunction!(py_fhenym_encrypt_csv, m)?)?;
+    m.add_function(wrap_pyfunction!(py_fhenym_server_remask, m)?)?;
+    m.add_function(wrap_pyfunction!(py_fhenym_format_pseudonymes_csv, m)?)?;
+    m.add_function(wrap_pyfunction!(py_fhenym_run_full, m)?)?;
 
     Ok(())
 }
